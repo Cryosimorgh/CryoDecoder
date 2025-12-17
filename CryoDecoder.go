@@ -1,3 +1,4 @@
+// decoder/decoder.go
 package cryodecoder
 
 import (
@@ -6,211 +7,206 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 )
 
-/*
-Wire format:
-
-BOF
-uint32 objectCount
-[ Object 1 ]
-[ Object 2 ]
-...
-[ Object N ]
-EOF
-
-Object format:
-
-uint8  lengthOfLength
-N      lengthBytes (big endian)
-TLV payload (length bytes)
-ObjectEndMarker
-*/
-
+// Define custom errors for clearer failure cases.
 var (
 	ErrInvalidBOF       = errors.New("invalid BOF marker")
 	ErrInvalidEOF       = errors.New("invalid EOF marker")
 	ErrInvalidObjectEnd = errors.New("invalid object end marker")
-	ErrUnknownFieldTag  = errors.New("unknown field tag")
-	ErrMalformedData    = errors.New("malformed data")
+	ErrUnknownFieldTag  = errors.New("unknown field tag in schema")
+	ErrTypeConversion   = errors.New("failed to convert value to the specified type")
+	ErrIncompleteData   = errors.New("reached end of data unexpectedly")
 )
 
+// Define the markers as byte slices for easy comparison.
 var (
 	BOFMarker       = []byte{0x80, 0x00, 0x00, 0x00}
 	EOFMarker       = []byte{0x00, 0x00, 0x00, 0x01}
 	ObjectEndMarker = []byte{0x66, 0x66, 0x66, 0x66}
 )
 
+// Decoder holds the state for our decoding process.
 type Decoder struct {
 	reader io.Reader
-	schema map[uint8]Codec
+	// The schema maps a field tag (uint8) to the type of data it holds.
+	schema map[uint8]reflect.Type
 }
 
-func NewDecoder(r io.Reader, schema map[uint8]Codec) *Decoder {
+// NewDecoder creates a new Decoder instance.
+// It takes an io.Reader for the data source and a schema to interpret the data.
+func NewDecoder(r io.Reader, schema map[uint8]reflect.Type) *Decoder {
 	return &Decoder{
 		reader: r,
 		schema: schema,
 	}
 }
 
-/*
-DecodeStream decodes the entire stream deterministically.
-No speculative reads. No EOF guessing.
-*/
+// DecodeStream reads the entire stream and decodes all objects within it.
 func (d *Decoder) DecodeStream() ([]map[uint8]any, error) {
-	// BOF
-	if err := d.readMarker(BOFMarker, ErrInvalidBOF); err != nil {
+	var allObjects []map[uint8]any
+
+	if err := d.validateMarker(BOFMarker, ErrInvalidBOF); err != nil {
 		return nil, err
 	}
 
-	// Object count
-	var objectCount uint32
-	if err := binary.Read(d.reader, binary.BigEndian, &objectCount); err != nil {
-		return nil, err
-	}
+	for {
+		// *** FIX STARTS HERE ***
+		// Before trying to read the next object, we must check if we are at the end of the stream.
+		// We do this by "peeking" ahead at the next few bytes without consuming them permanently.
+		// A simple way to do this is to read the bytes, check them, and if they are not the EOF marker,
+		// put them back into the reader for the next operation to consume.
 
-	objects := make([]map[uint8]any, 0, objectCount)
+		// Read 4 bytes (the length of the EOF marker) to check what's next.
+		var peekBytes = make([]byte, len(EOFMarker))
+		n, err := io.ReadFull(d.reader, peekBytes)
 
-	for i := uint32(0); i < objectCount; i++ {
-		obj, err := d.DecodeObject()
-		if err != nil {
-			return nil, fmt.Errorf("object %d: %w", i, err)
+		// If we hit an error while peeking, it means the stream is corrupted or ended unexpectedly.
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+			return nil, err
 		}
-		objects = append(objects, obj)
-	}
 
-	// EOF
-	if err := d.readMarker(EOFMarker, ErrInvalidEOF); err != nil {
-		return nil, err
-	}
+		// If we successfully read 4 bytes and they match the EOF marker, we are done.
+		if n == len(EOFMarker) && bytes.Equal(peekBytes, EOFMarker) {
+			// Successfully found the EOF marker, decoding is complete.
+			return allObjects, nil
+		}
 
-	return objects, nil
+		// If it's not the EOF marker, we need to put the bytes we just read back into the stream.
+		// We can do this by creating a new reader that first serves the "peeked" bytes
+		// and then continues with the original reader.
+		d.reader = io.MultiReader(bytes.NewReader(peekBytes[:n]), d.reader)
+		// *** FIX ENDS HERE ***
+
+		// Now it's safe to decode the object, as we've already handled the EOF case.
+		object, err := d.DecodeObject()
+		if err != nil {
+			// If an error occurs during DecodeObject (e.g., corrupted data), return it.
+			return nil, err
+		}
+		allObjects = append(allObjects, object)
+	}
 }
 
-/*
-DecodeObject decodes a single object.
-*/
+// DecodeObject reads a single object from the stream.
 func (d *Decoder) DecodeObject() (map[uint8]any, error) {
-	// Length-of-length
-	var lenOfLen uint8
-	if err := binary.Read(d.reader, binary.BigEndian, &lenOfLen); err != nil {
-		return nil, err
+	// 1. Read the "length of length buffer" (1 byte)
+	var lengthOfLengthBuffer uint8
+	if err := binary.Read(d.reader, binary.BigEndian, &lengthOfLengthBuffer); err != nil {
+		return nil, err // This will be io.EOF if the stream ends here.
 	}
 
-	if lenOfLen == 0 || lenOfLen > 8 {
-		return nil, ErrMalformedData
-	}
-
-	// Length buffer
-	lengthBytes := make([]byte, lenOfLen)
+	// 2. Read the "length buffer" itself
+	lengthBytes := make([]byte, lengthOfLengthBuffer)
 	if _, err := io.ReadFull(d.reader, lengthBytes); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: while reading length buffer", err)
 	}
 
-	// Interpret length (uint16 / uint32 supported)
-	var payloadLen uint64
-	switch lenOfLen {
-	case 2:
-		payloadLen = uint64(binary.BigEndian.Uint16(lengthBytes))
-	case 4:
-		payloadLen = uint64(binary.BigEndian.Uint32(lengthBytes))
-	default:
-		return nil, ErrMalformedData
+	// 3. Interpret the "length buffer" as the object's data length
+	var objectDataLength uint16
+	if err := binary.Read(bytes.NewReader(lengthBytes), binary.BigEndian, &objectDataLength); err != nil {
+		return nil, fmt.Errorf("%w: while parsing object data length", err)
 	}
 
-	// Payload
-	payload := make([]byte, payloadLen)
-	if _, err := io.ReadFull(d.reader, payload); err != nil {
-		return nil, err
+	// 4. Read the object data
+	objectData := make([]byte, objectDataLength)
+	if _, err := io.ReadFull(d.reader, objectData); err != nil {
+		return nil, fmt.Errorf("%w: while reading object data", err)
 	}
 
-	// Parse TLVs
-	obj, err := d.parseTLVPayload(payload)
+	// 5. Parse the TLV data within the object
+	parsedObject, err := d.parseTLVData(objectData)
 	if err != nil {
 		return nil, err
 	}
 
-	// Object end marker
-	if err := d.readMarker(ObjectEndMarker, ErrInvalidObjectEnd); err != nil {
+	// 6. Validate the object end marker
+	if err := d.validateMarker(ObjectEndMarker, ErrInvalidObjectEnd); err != nil {
 		return nil, err
 	}
 
-	return obj, nil
+	return parsedObject, nil
 }
 
-/*
-parseTLVPayload parses TLV data using the codec schema.
-*/
-func (d *Decoder) parseTLVPayload(data []byte) (map[uint8]any, error) {
+// parseTLVData iterates through the object's byte slice and decodes TLVs.
+func (d *Decoder) parseTLVData(data []byte) (map[uint8]any, error) {
 	result := make(map[uint8]any)
 	buf := bytes.NewReader(data)
 
 	for buf.Len() > 0 {
-		// Tag
-		tag, err := buf.ReadByte()
-		if err != nil {
-			return nil, ErrMalformedData
+		// Read Tag (1 byte)
+		var tag uint8
+		if err := binary.Read(buf, binary.BigEndian, &tag); err != nil {
+			return nil, fmt.Errorf("%w: while reading tag", ErrIncompleteData)
 		}
 
-		codec, ok := d.schema[tag]
+		// Read "Length of Length" (1 byte)
+		var lenOfLen uint8
+		if err := binary.Read(buf, binary.BigEndian, &lenOfLen); err != nil {
+			return nil, fmt.Errorf("%w: while reading length-of-length", ErrIncompleteData)
+		}
+
+		// Read Length (N bytes)
+		lengthBytes := make([]byte, lenOfLen)
+		if _, err := io.ReadFull(buf, lengthBytes); err != nil {
+			return nil, fmt.Errorf("%w: while reading length", ErrIncompleteData)
+		}
+		var length uint16
+		if err := binary.Read(bytes.NewReader(lengthBytes), binary.BigEndian, &length); err != nil {
+			return nil, fmt.Errorf("%w: could not parse length", ErrIncompleteData)
+		}
+
+		// Read Value
+		valueBytes := make([]byte, length)
+		if _, err := io.ReadFull(buf, valueBytes); err != nil {
+			return nil, fmt.Errorf("%w: while reading value", ErrIncompleteData)
+		}
+
+		// Decode value based on schema
+		fieldType, ok := d.schema[tag]
 		if !ok {
 			return nil, fmt.Errorf("%w: %d", ErrUnknownFieldTag, tag)
 		}
 
-		// Length-of-length
-		lenOfLen, err := buf.ReadByte()
+		decodedValue, err := d.decodeValue(valueBytes, fieldType)
 		if err != nil {
-			return nil, ErrMalformedData
+			return nil, fmt.Errorf("%w for tag %d", err, tag)
 		}
 
-		if lenOfLen == 0 || lenOfLen > 8 {
-			return nil, ErrMalformedData
-		}
-
-		// Length
-		lengthBytes := make([]byte, lenOfLen)
-		if _, err := io.ReadFull(buf, lengthBytes); err != nil {
-			return nil, ErrMalformedData
-		}
-
-		var valueLen uint64
-		switch lenOfLen {
-		case 2:
-			valueLen = uint64(binary.BigEndian.Uint16(lengthBytes))
-		case 4:
-			valueLen = uint64(binary.BigEndian.Uint32(lengthBytes))
-		default:
-			return nil, ErrMalformedData
-		}
-
-		// Value
-		valueBytes := make([]byte, valueLen)
-		if _, err := io.ReadFull(buf, valueBytes); err != nil {
-			return nil, ErrMalformedData
-		}
-
-		// Decode via codec
-		value, err := codec.Decode(valueBytes)
-		if err != nil {
-			return nil, err
-		}
-
-		result[tag] = value
+		result[tag] = decodedValue
 	}
 
 	return result, nil
 }
 
-/*
-readMarker reads and validates a fixed marker.
-*/
-func (d *Decoder) readMarker(expected []byte, err error) error {
-	buf := make([]byte, len(expected))
-	if _, e := io.ReadFull(d.reader, buf); e != nil {
-		return e
+// decodeValue converts a byte slice to a specific Go type.
+func (d *Decoder) decodeValue(data []byte, targetType reflect.Type) (any, error) {
+	buf := bytes.NewReader(data)
+	switch targetType.Kind() {
+	case reflect.String:
+		return string(data), nil
+	case reflect.Int32:
+		var val int32
+		err := binary.Read(buf, binary.BigEndian, &val)
+		return val, err
+	case reflect.Float64:
+		var val float64
+		err := binary.Read(buf, binary.BigEndian, &val)
+		return val, err
+	default:
+		return nil, fmt.Errorf("%w: %s", ErrTypeConversion, targetType.Kind())
 	}
-	if !bytes.Equal(buf, expected) {
+}
+
+// validateMarker reads a number of bytes from the reader and checks them against an expected marker.
+func (d *Decoder) validateMarker(expectedMarker []byte, customErr error) error {
+	marker := make([]byte, len(expectedMarker))
+	if _, err := io.ReadFull(d.reader, marker); err != nil {
 		return err
+	}
+	if !bytes.Equal(marker, expectedMarker) {
+		return customErr
 	}
 	return nil
 }
