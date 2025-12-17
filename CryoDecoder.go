@@ -1,5 +1,5 @@
 // decoder/decoder.go
-package main
+package cryodecoder
 
 import (
 	"bytes"
