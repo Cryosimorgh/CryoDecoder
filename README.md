@@ -21,7 +21,7 @@ go get example.com/cryodecoder
 The library supports all Go primitive types out of the box. Platform-dependent types (`int`, `uint`) are serialized as fixed-size (`int64`, `uint64`) for cross-platform compatibility.
 
 -   `int`, `int8`, `int16`, `int32`, `int64`
--   `uint`, `uint8` (byte), `uint16`, `uint32`, `uint64`, `uintptr`
+-   `uint`, `uint8` `byte`, `uint16`, `uint32`, `uint64`, `uintptr`
 -   `float32`, `float64`
 -   `bool`
 -   `string`
