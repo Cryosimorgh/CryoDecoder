@@ -70,7 +70,7 @@ func (r *CodecRegistry) RegisterPrimitives() {
 }
 
 // resolveType finds or creates a codec for the given reflect.Type.
-// MODIFIED: Now handles pointers automatically by wrapping the underlying type's codec.
+// MODIFIED: Now handles pointers, slices, arrays, and maps automatically by wrapping the underlying type's codec.
 func (r *CodecRegistry) resolveType(t reflect.Type) (reflect.Type, byte, error) {
 	// 1. Check direct registry
 	if tag, exists := r.types[t]; exists {
@@ -102,7 +102,83 @@ func (r *CodecRegistry) resolveType(t reflect.Type) (reflect.Type, byte, error) 
 		return t, ptrTag, nil
 	}
 
-	// 3. Handle specific known types (e.g. time.Location) that we can't introspect
+	// 3. Handle Slices recursively
+	if t.Kind() == reflect.Slice {
+		elemType, elemTag, err := r.resolveType(t.Elem())
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to resolve slice element %v: %w", t.Elem(), err)
+		}
+
+		elemCodec, err := r.GetCodec(elemTag)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		sliceTag := r.nextStructTag
+		r.nextStructTag++
+
+		// Create a zero instance of the slice to register the type
+		sliceZero := reflect.MakeSlice(t, 0, 0).Interface()
+
+		r.RegisterCodec(sliceTag, &SliceCodec{elemCodec: elemCodec, elemType: elemType}, sliceZero)
+		return t, sliceTag, nil
+	}
+
+	// 4. Handle Arrays recursively
+	if t.Kind() == reflect.Array {
+		elemType, elemTag, err := r.resolveType(t.Elem())
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to resolve array element %v: %w", t.Elem(), err)
+		}
+
+		elemCodec, err := r.GetCodec(elemTag)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		arrayTag := r.nextStructTag
+		r.nextStructTag++
+
+		// Create a zero instance of the array to register the type
+		arrayZero := reflect.New(t).Elem().Interface()
+
+		r.RegisterCodec(arrayTag, &ArrayCodec{elemCodec: elemCodec, elemType: elemType, arrayLen: t.Len()}, arrayZero)
+		return t, arrayTag, nil
+	}
+
+	// 5. Handle Maps recursively
+	if t.Kind() == reflect.Map {
+		keyType, keyTag, err := r.resolveType(t.Key())
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to resolve map key type %v: %w", t.Key(), err)
+		}
+
+		valType, valTag, err := r.resolveType(t.Elem())
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to resolve map value type %v: %w", t.Elem(), err)
+		}
+
+		keyCodec, err := r.GetCodec(keyTag)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		valCodec, err := r.GetCodec(valTag)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		mapTag := r.nextStructTag
+		r.nextStructTag++
+
+		// Create a zero instance of the map to register the type
+		mapZero := reflect.MakeMap(t).Interface()
+
+		r.RegisterCodec(mapTag, &MapCodec{keyCodec: keyCodec, valCodec: valCodec, keyType: keyType, valType: valType}, mapZero)
+		return t, mapTag, nil
+	}
+
+	// 6. Handle specific known types (e.g. time.Location) that we can't introspect
 	if t.PkgPath() == "time" && t.Name() == "Location" {
 		locTag := r.nextStructTag
 		r.nextStructTag++
@@ -110,7 +186,7 @@ func (r *CodecRegistry) resolveType(t reflect.Type) (reflect.Type, byte, error) 
 		return t, locTag, nil
 	}
 
-	// 4. Check for BinaryMarshaler (for other built-in types)
+	// 7. Check for BinaryMarshaler (for other built-in types)
 	if t.Implements(reflect.TypeOf((*encoding.BinaryMarshaler)(nil)).Elem()) {
 		marshalTag := r.nextStructTag
 		r.nextStructTag++
@@ -119,7 +195,7 @@ func (r *CodecRegistry) resolveType(t reflect.Type) (reflect.Type, byte, error) 
 		return t, marshalTag, nil
 	}
 
-	// 5. Handle Structs (Recursion)
+	// 8. Handle Structs (Recursion)
 	if t.Kind() == reflect.Struct {
 		zeroValue := reflect.New(t).Elem().Interface()
 		structTag, err := r.RegisterStruct(zeroValue)
@@ -154,7 +230,7 @@ func (r *CodecRegistry) RegisterStruct(exampleType interface{}) (byte, error) {
 		field := structType.Field(i)
 		fieldType := field.Type
 
-		// Use resolveType to handle the complexity of pointers, locations, etc.
+		// Use resolveType to handle the complexity of pointers, locations, collections, etc.
 		_, typeTag, err := r.resolveType(fieldType)
 		if err != nil {
 			return 0, fmt.Errorf("failed to resolve codec for field '%s' (%v): %w", field.Name, fieldType, err)
@@ -189,10 +265,19 @@ func (r *CodecRegistry) GetCodec(tag byte) (Codec, error) {
 
 // GetTag retrieves the tag associated with a given value's type.
 func (r *CodecRegistry) GetTag(value interface{}) (byte, error) {
-	tag, exists := r.types[reflect.TypeOf(value)]
-	if !exists {
-		return 0, fmt.Errorf("no tag registered for type %T", value)
+	t := reflect.TypeOf(value)
+
+	// First, check if the type is already registered
+	if tag, exists := r.types[t]; exists {
+		return tag, nil
 	}
+
+	// If not registered, try to resolve it (handles collections, pointers, etc.)
+	_, tag, err := r.resolveType(t)
+	if err != nil {
+		return 0, fmt.Errorf("no tag registered for type %T: %w", value, err)
+	}
+
 	return tag, nil
 }
 
@@ -918,6 +1003,280 @@ func (c *MapStringAnyCodec) Decode(data []byte) (interface{}, error) {
 	return result, nil
 }
 
+// --- NEW: Collection Codecs (Slices, Arrays, Maps) ---
+
+// SliceCodec handles slice types []T.
+// It stores the count of elements followed by each encoded element.
+type SliceCodec struct {
+	elemCodec Codec
+	elemType  reflect.Type
+}
+
+func (c *SliceCodec) Encode(value interface{}) ([]byte, error) {
+	rv := reflect.ValueOf(value)
+	if rv.Kind() != reflect.Slice {
+		return nil, fmt.Errorf("SliceCodec expects a slice, got %T", value)
+	}
+
+	buf := &bytes.Buffer{}
+
+	// Write the count of elements
+	count := uint32(rv.Len())
+	if err := binary.Write(buf, binary.BigEndian, count); err != nil {
+		return nil, err
+	}
+
+	// Encode each element
+	for i := 0; i < rv.Len(); i++ {
+		elemVal := rv.Index(i).Interface()
+		elemData, err := c.elemCodec.Encode(elemVal)
+		if err != nil {
+			return nil, fmt.Errorf("error encoding slice element %d: %w", i, err)
+		}
+
+		// Write element length and data
+		if err := binary.Write(buf, binary.BigEndian, uint32(len(elemData))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.Write(elemData); err != nil {
+			return nil, err
+		}
+	}
+
+	return buf.Bytes(), nil
+}
+
+func (c *SliceCodec) Decode(data []byte) (interface{}, error) {
+	reader := bytes.NewReader(data)
+
+	var count uint32
+	if err := binary.Read(reader, binary.BigEndian, &count); err != nil {
+		return nil, fmt.Errorf("failed to read slice count: %w", err)
+	}
+
+	// Create a slice of the appropriate type
+	sliceType := reflect.SliceOf(c.elemType)
+	slice := reflect.MakeSlice(sliceType, int(count), int(count))
+
+	for i := 0; i < int(count); i++ {
+		var elemLen uint32
+		if err := binary.Read(reader, binary.BigEndian, &elemLen); err != nil {
+			return nil, fmt.Errorf("failed to read element %d length: %w", i, err)
+		}
+
+		elemData := make([]byte, elemLen)
+		if _, err := io.ReadFull(reader, elemData); err != nil {
+			return nil, fmt.Errorf("failed to read element %d data: %w", i, err)
+		}
+
+		elemVal, err := c.elemCodec.Decode(elemData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode element %d: %w", i, err)
+		}
+
+		// Set the element in the slice
+		rv := reflect.ValueOf(elemVal)
+		if rv.Type().ConvertibleTo(c.elemType) {
+			rv = rv.Convert(c.elemType)
+		}
+		slice.Index(i).Set(rv)
+	}
+
+	return slice.Interface(), nil
+}
+
+// ArrayCodec handles array types [N]T.
+// It stores each encoded element in order.
+type ArrayCodec struct {
+	elemCodec Codec
+	elemType  reflect.Type
+	arrayLen  int
+}
+
+func (c *ArrayCodec) Encode(value interface{}) ([]byte, error) {
+	rv := reflect.ValueOf(value)
+	if rv.Kind() != reflect.Array {
+		return nil, fmt.Errorf("ArrayCodec expects an array, got %T", value)
+	}
+
+	if rv.Len() != c.arrayLen {
+		return nil, fmt.Errorf("array length mismatch: expected %d, got %d", c.arrayLen, rv.Len())
+	}
+
+	buf := &bytes.Buffer{}
+
+	// Encode each element
+	for i := 0; i < rv.Len(); i++ {
+		elemVal := rv.Index(i).Interface()
+		elemData, err := c.elemCodec.Encode(elemVal)
+		if err != nil {
+			return nil, fmt.Errorf("error encoding array element %d: %w", i, err)
+		}
+
+		// Write element length and data
+		if err := binary.Write(buf, binary.BigEndian, uint32(len(elemData))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.Write(elemData); err != nil {
+			return nil, err
+		}
+	}
+
+	return buf.Bytes(), nil
+}
+
+func (c *ArrayCodec) Decode(data []byte) (interface{}, error) {
+	reader := bytes.NewReader(data)
+
+	// Create an array of the appropriate type
+	arrayType := reflect.ArrayOf(c.arrayLen, c.elemType)
+	array := reflect.New(arrayType).Elem()
+
+	for i := 0; i < c.arrayLen; i++ {
+		var elemLen uint32
+		if err := binary.Read(reader, binary.BigEndian, &elemLen); err != nil {
+			return nil, fmt.Errorf("failed to read array element %d length: %w", i, err)
+		}
+
+		elemData := make([]byte, elemLen)
+		if _, err := io.ReadFull(reader, elemData); err != nil {
+			return nil, fmt.Errorf("failed to read array element %d data: %w", i, err)
+		}
+
+		elemVal, err := c.elemCodec.Decode(elemData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode array element %d: %w", i, err)
+		}
+
+		// Set the element in the array
+		rv := reflect.ValueOf(elemVal)
+		if rv.Type().ConvertibleTo(c.elemType) {
+			rv = rv.Convert(c.elemType)
+		}
+		array.Index(i).Set(rv)
+	}
+
+	return array.Interface(), nil
+}
+
+// MapCodec handles map types map[K]V.
+// It stores the count of entries followed by each key-value pair.
+type MapCodec struct {
+	keyCodec Codec
+	valCodec Codec
+	keyType  reflect.Type
+	valType  reflect.Type
+}
+
+func (c *MapCodec) Encode(value interface{}) ([]byte, error) {
+	rv := reflect.ValueOf(value)
+	if rv.Kind() != reflect.Map {
+		return nil, fmt.Errorf("MapCodec expects a map, got %T", value)
+	}
+
+	buf := &bytes.Buffer{}
+
+	// Write the count of entries
+	count := uint32(rv.Len())
+	if err := binary.Write(buf, binary.BigEndian, count); err != nil {
+		return nil, err
+	}
+
+	// Encode each key-value pair
+	for _, keyVal := range rv.MapKeys() {
+		key := keyVal.Interface()
+		val := rv.MapIndex(keyVal).Interface()
+
+		keyData, err := c.keyCodec.Encode(key)
+		if err != nil {
+			return nil, fmt.Errorf("error encoding map key %v: %w", key, err)
+		}
+
+		valData, err := c.valCodec.Encode(val)
+		if err != nil {
+			return nil, fmt.Errorf("error encoding map value for key %v: %w", key, err)
+		}
+
+		// Write key length and data
+		if err := binary.Write(buf, binary.BigEndian, uint32(len(keyData))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.Write(keyData); err != nil {
+			return nil, err
+		}
+
+		// Write value length and data
+		if err := binary.Write(buf, binary.BigEndian, uint32(len(valData))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.Write(valData); err != nil {
+			return nil, err
+		}
+	}
+
+	return buf.Bytes(), nil
+}
+
+func (c *MapCodec) Decode(data []byte) (interface{}, error) {
+	reader := bytes.NewReader(data)
+
+	var count uint32
+	if err := binary.Read(reader, binary.BigEndian, &count); err != nil {
+		return nil, fmt.Errorf("failed to read map count: %w", err)
+	}
+
+	// Create a map of the appropriate type
+	mapType := reflect.MapOf(c.keyType, c.valType)
+	m := reflect.MakeMap(mapType)
+
+	for i := 0; i < int(count); i++ {
+		var keyLen uint32
+		if err := binary.Read(reader, binary.BigEndian, &keyLen); err != nil {
+			return nil, fmt.Errorf("failed to read map entry %d key length: %w", i, err)
+		}
+
+		keyData := make([]byte, keyLen)
+		if _, err := io.ReadFull(reader, keyData); err != nil {
+			return nil, fmt.Errorf("failed to read map entry %d key data: %w", i, err)
+		}
+
+		keyVal, err := c.keyCodec.Decode(keyData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode map entry %d key: %w", i, err)
+		}
+
+		var valLen uint32
+		if err := binary.Read(reader, binary.BigEndian, &valLen); err != nil {
+			return nil, fmt.Errorf("failed to read map entry %d value length: %w", i, err)
+		}
+
+		valData := make([]byte, valLen)
+		if _, err := io.ReadFull(reader, valData); err != nil {
+			return nil, fmt.Errorf("failed to read map entry %d value data: %w", i, err)
+		}
+
+		valVal, err := c.valCodec.Decode(valData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode map entry %d value: %w", i, err)
+		}
+
+		// Set the key-value pair in the map
+		keyRv := reflect.ValueOf(keyVal)
+		if keyRv.Type().ConvertibleTo(c.keyType) {
+			keyRv = keyRv.Convert(c.keyType)
+		}
+
+		valRv := reflect.ValueOf(valVal)
+		if valRv.Type().ConvertibleTo(c.valType) {
+			valRv = valRv.Convert(c.valType)
+		}
+
+		m.SetMapIndex(keyRv, valRv)
+	}
+
+	return m.Interface(), nil
+}
+
 // --- NEW: Specialized Codecs ---
 
 // LocationCodec handles time.Location.
@@ -987,7 +1346,7 @@ func (c *PointerCodec) Decode(data []byte) (interface{}, error) {
 
 	if data[0] == 0 {
 		// Return a nil pointer of the correct type
-		return reflect.Zero(c.elemType).Interface(), nil // Wait, this returns the zero value of T, not *T
+		return reflect.Zero(reflect.PtrTo(c.elemType)).Interface(), nil
 	}
 
 	// Decode the inner element
@@ -1051,13 +1410,3 @@ func (c *MarshalerCodec) Decode(data []byte) (interface{}, error) {
 
 	return ptr.Elem().Interface(), nil
 }
-
-// func main() {
-// 	registry := NewCodecRegistry()
-// 	registry.RegisterPrimitives()
-// 	registry.RegisterStruct(Asdasd{})
-// }
-// type Asdasd struct {
-// 	types map[string]any
-// 	time *time.Time
-// }
