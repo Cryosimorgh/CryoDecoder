@@ -7,6 +7,7 @@ package cryodecoder
 
 import (
 	"bytes"
+	"encoding"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -47,7 +48,7 @@ func NewCodecRegistry() *CodecRegistry {
 // It assigns standard tags:
 // int32(1), string(2), float64(3), int64(4), bool(5), int(6), int8(7), int16(8),
 // uint(9), uint8(10), uint16(11), uint32(12), uint64(13), uintptr(14), float32(15),
-// complex64(16), complex128(17).
+// complex64(16), complex128(17), interface{}(18), map[string]interface{}(19).
 // Note: Platform-dependent types (int, uint, uintptr) are serialized as int64 or uint64
 // for cross-platform compatibility.
 func (r *CodecRegistry) RegisterPrimitives() {
@@ -68,11 +69,14 @@ func (r *CodecRegistry) RegisterPrimitives() {
 	r.RegisterCodec(15, &Float32Codec{}, float32(0))
 	r.RegisterCodec(16, &Complex64Codec{}, complex64(0))
 	r.RegisterCodec(17, &Complex128Codec{}, complex128(0))
+	// NEW: Register dynamic types
+	r.RegisterCodec(18, &InterfaceCodec{registry: r}, []interface{}{}[0]) // interface{}
+	r.RegisterCodec(19, &MapStringAnyCodec{registry: r}, map[string]interface{}(nil))
 }
 
 // RegisterStruct automatically registers a custom struct and all of its nested structs.
-// It uses reflection to discover fields and their types, creating and registering
-// the necessary codecs. It returns the tag assigned to the registered struct.
+// MODIFIED: It now attempts to use BinaryMarshaler for types that aren't registered,
+// allowing support for private/built-in structs like time.Time.
 func (r *CodecRegistry) RegisterStruct(exampleType interface{}) (byte, error) {
 	structType := reflect.TypeOf(exampleType)
 	if structType.Kind() == reflect.Ptr {
@@ -95,20 +99,39 @@ func (r *CodecRegistry) RegisterStruct(exampleType interface{}) (byte, error) {
 		field := structType.Field(i)
 		fieldType := field.Type
 
-		// If the field is a nested struct, register it recursively first.
-		if fieldType.Kind() == reflect.Struct {
-			nestedInstance := reflect.New(fieldType).Interface()
-			_, err := r.RegisterStruct(nestedInstance)
-			if err != nil {
-				return 0, fmt.Errorf("failed to register nested struct %s: %w", fieldType.Name(), err)
+		// Helper to ensure we have a tag for the field type
+		getOrRegisterTag := func(t reflect.Type) (byte, error) {
+			// Check if already known
+			if tag, exists := r.types[t]; exists {
+				return tag, nil
 			}
+
+			// NEW: Check if it implements BinaryMarshaler.
+			// This allows handling private/built-in structs (e.g., time.Time) automatically.
+			if t.Implements(reflect.TypeFor[encoding.BinaryMarshaler]()) {
+				newTag := r.nextStructTag
+				r.nextStructTag++
+
+				// Create a zero value to register the type
+				zeroValue := reflect.New(t).Elem().Interface()
+
+				// Register the generic MarshalerCodec
+				r.RegisterCodec(newTag, &MarshalerCodec{typ: t}, zeroValue)
+				return newTag, nil
+			}
+
+			// If it's a struct we don't know, try to register it recursively
+			if t.Kind() == reflect.Struct {
+				nestedInstance := reflect.New(t).Interface()
+				return r.RegisterStruct(nestedInstance)
+			}
+
+			return 0, fmt.Errorf("no codec registered for type %v and it is not a struct or BinaryMarshaler", t)
 		}
 
-		// Find the tag for the field's type.
-		fieldValue := reflect.New(fieldType).Elem().Interface()
-		typeTag, err := r.GetTag(fieldValue)
+		typeTag, err := getOrRegisterTag(fieldType)
 		if err != nil {
-			return 0, fmt.Errorf("no codec registered for field '%s' of type %v. Please ensure its type is registered first.", field.Name, fieldType)
+			return 0, fmt.Errorf("failed to resolve codec for field '%s' (%v): %w", field.Name, fieldType, err)
 		}
 
 		// Register the field with the struct codec.
@@ -169,6 +192,15 @@ func (e *Encoder) Encode(value interface{}) ([]byte, error) {
 	if err := e.buffer.WriteByte(BOF); err != nil {
 		return nil, fmt.Errorf("failed to write BOF marker: %w", err)
 	}
+
+	// NEW: Handle interface{} wrapping dynamically if necessary.
+	// If the value is an interface{}, we treat it as an "Any" type,
+	// ensuring we capture the concrete type tag.
+	val := reflect.ValueOf(value)
+	if val.Kind() == reflect.Interface && !val.IsNil() {
+		value = val.Elem().Interface()
+	}
+
 	tag, err := e.registry.GetTag(value)
 	if err != nil {
 		return nil, fmt.Errorf("encoding failed: %w", err)
@@ -657,11 +689,17 @@ func (c *StructCodec) Encode(value interface{}) ([]byte, error) {
 		if !fieldVal.IsValid() {
 			return nil, fmt.Errorf("field %s not found in struct value", field.name)
 		}
+
+		// MODIFIED: Extract interface safely for interface{} types
+		var fieldValue interface{} = fieldVal.Interface()
+		if fieldVal.Kind() == reflect.Interface && !fieldVal.IsNil() {
+			fieldValue = fieldVal.Elem().Interface()
+		}
+
 		codec, err := c.registry.GetCodec(field.typeTag)
 		if err != nil {
 			return nil, fmt.Errorf("error getting codec for field %s: %w", field.name, err)
 		}
-		fieldValue := fieldVal.Interface()
 		encodedValue, err := codec.Encode(fieldValue)
 		if err != nil {
 			return nil, fmt.Errorf("error encoding field %s: %w", field.name, err)
@@ -710,10 +748,225 @@ func (c *StructCodec) Decode(data []byte) (interface{}, error) {
 			val := reflect.ValueOf(decodedValue)
 			if val.Type().ConvertibleTo(structField.Type()) {
 				structField.Set(val.Convert(structField.Type()))
+			} else if structField.Type() == reflect.TypeOf((*interface{})(nil)).Elem() {
+				structField.Set(val)
 			} else {
 				return nil, fmt.Errorf("cannot convert decoded value %v (%v) to field type %v for field %s", decodedValue, val.Type(), structField.Type(), field.name)
 			}
 		}
 	}
 	return result.Interface(), nil
+}
+
+// --- NEW: Support for map[string]interface{} and interface{} ---
+
+// InterfaceCodec handles any type by storing its concrete type tag and data.
+type InterfaceCodec struct {
+	registry *CodecRegistry
+}
+
+func (c *InterfaceCodec) Encode(value interface{}) ([]byte, error) {
+	if value == nil {
+		// Represent nil as 0 length? Or specific tag?
+		// Simplest is to return empty bytes or handle as specific type.
+		// Here we treat nil as valid but empty payload for the interface itself,
+		// but the TLV wrapper handles length.
+		// However, we need to know what type it is to decode.
+		// Standard convention: empty bytes = nil.
+		return []byte{}, nil
+	}
+
+	tag, err := c.registry.GetTag(value)
+	if err != nil {
+		return nil, err
+	}
+
+	payload, err := c.registry.GetCodec(tag)
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := payload.Encode(value)
+	if err != nil {
+		return nil, err
+	}
+
+	// Format: Tag(1) | Len(2) | Data
+	buf := make([]byte, 1+2+len(data))
+	buf[0] = tag
+	binary.BigEndian.PutUint16(buf[1:3], uint16(len(data)))
+	copy(buf[3:], data)
+	return buf, nil
+}
+
+func (c *InterfaceCodec) Decode(data []byte) (interface{}, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+	if len(data) < 3 {
+		return nil, fmt.Errorf("invalid interface data: too short")
+	}
+
+	tag := data[0]
+	length := binary.BigEndian.Uint16(data[1:3])
+	if uint16(len(data)) < 3+length {
+		return nil, fmt.Errorf("invalid interface data: length mismatch")
+	}
+
+	codec, err := c.registry.GetCodec(tag)
+	if err != nil {
+		return nil, err
+	}
+
+	return codec.Decode(data[3 : 3+length])
+}
+
+// MapStringAnyCodec handles map[string]interface{}.
+type MapStringAnyCodec struct {
+	registry *CodecRegistry
+}
+
+func (c *MapStringAnyCodec) Encode(value interface{}) ([]byte, error) {
+	m, ok := value.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("value is not map[string]interface{}")
+	}
+
+	// We use a helper buffer to calculate size
+	buf := &bytes.Buffer{}
+
+	// Count
+	if err := binary.Write(buf, binary.BigEndian, uint32(len(m))); err != nil {
+		return nil, err
+	}
+
+	stringCodec := &StringCodec{}
+	anyCodec := &InterfaceCodec{registry: c.registry}
+
+	for k, v := range m {
+		// Key
+		kBytes, err := stringCodec.Encode(k)
+		if err != nil {
+			return nil, err
+		}
+		if err := binary.Write(buf, binary.BigEndian, uint16(len(kBytes))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.Write(kBytes); err != nil {
+			return nil, err
+		}
+
+		// Value (using InterfaceCodec logic which outputs Tag+Len+Val)
+		vBytes, err := anyCodec.Encode(v)
+		if err != nil {
+			return nil, fmt.Errorf("encoding map value for key %s: %w", k, err)
+		}
+		if err := binary.Write(buf, binary.BigEndian, uint16(len(vBytes))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.Write(vBytes); err != nil {
+			return nil, err
+		}
+	}
+
+	return buf.Bytes(), nil
+}
+
+func (c *MapStringAnyCodec) Decode(data []byte) (interface{}, error) {
+	reader := bytes.NewReader(data)
+
+	var count uint32
+	if err := binary.Read(reader, binary.BigEndian, &count); err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]interface{}, count)
+	stringCodec := &StringCodec{}
+	anyCodec := &InterfaceCodec{registry: c.registry}
+
+	for i := 0; i < int(count); i++ {
+		// Key Length
+		var kLen uint16
+		if err := binary.Read(reader, binary.BigEndian, &kLen); err != nil {
+			return nil, err
+		}
+		// Key Data
+		kBytes := make([]byte, kLen)
+		if _, err := io.ReadFull(reader, kBytes); err != nil {
+			return nil, err
+		}
+		keyVal, err := stringCodec.Decode(kBytes)
+		if err != nil {
+			return nil, err
+		}
+		key := keyVal.(string)
+
+		// Val Length
+		var vLen uint16
+		if err := binary.Read(reader, binary.BigEndian, &vLen); err != nil {
+			return nil, err
+		}
+		// Val Data
+		vBytes := make([]byte, vLen)
+		if _, err := io.ReadFull(reader, vBytes); err != nil {
+			return nil, err
+		}
+		val, err := anyCodec.Decode(vBytes)
+		if err != nil {
+			return nil, fmt.Errorf("decoding map value for key %s: %w", key, err)
+		}
+
+		result[key] = val
+	}
+
+	return result, nil
+}
+
+// --- NEW: Support for private/built-in structs via BinaryMarshaler ---
+
+// MarshalerCodec wraps types that implement encoding.BinaryMarshaler/Unmarshaler.
+// This is useful for time.Time and other stdlib types you cannot introspect.
+type MarshalerCodec struct {
+	typ reflect.Type
+}
+
+func (c *MarshalerCodec) Encode(value interface{}) ([]byte, error) {
+	m, ok := value.(encoding.BinaryMarshaler)
+	if !ok {
+		return nil, fmt.Errorf("type %v does not implement BinaryMarshaler", c.typ)
+	}
+	data, err := m.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	// Prefix with length so we know how many bytes to consume during Unmarshal
+	buf := make([]byte, 2+len(data))
+	binary.BigEndian.PutUint16(buf[0:2], uint16(len(data)))
+	copy(buf[2:], data)
+	return buf, nil
+}
+
+func (c *MarshalerCodec) Decode(data []byte) (interface{}, error) {
+	if len(data) < 2 {
+		return nil, fmt.Errorf("invalid data for MarshalerCodec: too short")
+	}
+	length := binary.BigEndian.Uint16(data[0:2])
+	if uint16(len(data)) < 2+length {
+		return nil, fmt.Errorf("invalid data for MarshalerCodec: length mismatch")
+	}
+
+	// Create a new instance of the concrete type
+	ptr := reflect.New(c.typ)
+	instance := ptr.Interface()
+
+	u, ok := instance.(encoding.BinaryUnmarshaler)
+	if !ok {
+		return nil, fmt.Errorf("type %v does not implement BinaryUnmarshaler", c.typ)
+	}
+
+	if err := u.UnmarshalBinary(data[2 : 2+length]); err != nil {
+		return nil, err
+	}
+
+	return ptr.Elem().Interface(), nil
 }
