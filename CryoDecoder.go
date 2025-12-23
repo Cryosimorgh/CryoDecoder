@@ -3,7 +3,7 @@
 //
 // The system is designed for simplicity. After registering primitive types,
 // complex structs can be registered with a single function call.
-package cryodecoder
+package CryoDecoder
 
 import (
 	"bytes"
@@ -39,7 +39,7 @@ type CodecRegistry struct {
 func NewCodecRegistry() *CodecRegistry {
 	return &CodecRegistry{
 		codecs:        make(map[byte]Codec),
-		types:         make(map[reflect.Type]byte),
+		types:         make(map[reflect.Type]byte, 0),
 		nextStructTag: 200, // Reserve tags 0-199 for primitives, start struct tags at 200
 	}
 }
@@ -70,8 +70,8 @@ func (r *CodecRegistry) RegisterPrimitives() {
 	r.RegisterCodec(16, &Complex64Codec{}, complex64(0))
 	r.RegisterCodec(17, &Complex128Codec{}, complex128(0))
 	// NEW: Register dynamic types
-	r.RegisterCodec(18, &InterfaceCodec{registry: r}, []interface{}{}[0]) // interface{}
-	r.RegisterCodec(19, &MapStringAnyCodec{registry: r}, map[string]interface{}(nil))
+	r.RegisterCodec(18, &InterfaceCodec{registry: r}, []any{}) // interface{}
+	r.RegisterCodec(19, &MapStringAnyCodec{registry: r}, map[string]any(nil))
 }
 
 // RegisterStruct automatically registers a custom struct and all of its nested structs.
@@ -79,7 +79,7 @@ func (r *CodecRegistry) RegisterPrimitives() {
 // allowing support for private/built-in structs like time.Time.
 func (r *CodecRegistry) RegisterStruct(exampleType interface{}) (byte, error) {
 	structType := reflect.TypeOf(exampleType)
-	if structType.Kind() == reflect.Ptr {
+	if structType.Kind() == reflect.Pointer {
 		structType = structType.Elem()
 	}
 	if structType.Kind() != reflect.Struct {
@@ -970,3 +970,13 @@ func (c *MarshalerCodec) Decode(data []byte) (interface{}, error) {
 
 	return ptr.Elem().Interface(), nil
 }
+
+// func main() {
+// 	registry := NewCodecRegistry()
+// 	registry.RegisterPrimitives()
+// 	registry.RegisterStruct(Asdasd{})
+// }
+// type Asdasd struct {
+// 	types map[reflect.Type]any
+// 	time time.Time
+// }
